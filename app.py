@@ -6,19 +6,20 @@ PostgreSQL como fonte da verdade.
 
 Fluxo:
   1. Carrega configuração do .env
-  2. Lê o XML de entrada (preservando a estrutura via lxml)
-  3. Cria uma cópia do arquivo (o original nunca é alterado)
-  4. Conecta ao PostgreSQL
-  5. Carrega os profissionais do banco em memória (1 query)
-  6. Varre os <DADOS_PROFISSIONAIS> do XML
-  7. Compara o CPF do XML com o do banco (busca pelo nome normalizado)
+  2. Baixa o XML de entrada do endpoint do CNES (IBGE/COMPETENCIA)
+  3. Lê o XML de entrada (preservando a estrutura via lxml)
+  4. Cria uma cópia do arquivo (o original nunca é alterado)
+  5. Conecta ao PostgreSQL
+  6. Carrega os profissionais do banco em memória (1 query)
+  7. Varre os <DADOS_PROFISSIONAIS> do XML
+  8. Compara o CPF do XML com o do banco (busca pelo nome normalizado)
      - igual            -> OK            (nada a fazer)
      - diferente        -> CORRIGIDO     (substitui CPF_PROF na cópia)
      - nome ausente     -> NAO_ENCONTRADO
      - nome ambíguo     -> AMBIGUO       (mais de um CPF distinto p/ o mesmo nome)
-  8. Grava a cópia corrigida
-  9. Gera relatório CSV
- 10. Imprime o resumo final
+  9. Grava a cópia corrigida
+ 10. Gera relatório CSV
+ 11. Imprime o resumo final
 """
 
 import csv
@@ -30,6 +31,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 
+import requests
 from dotenv import load_dotenv
 from lxml import etree
 
@@ -113,14 +115,16 @@ def perguntar_origem() -> str:
 # Etapa 1 — Configuração
 # --------------------------------------------------------------------------- #
 def carregar_config() -> dict:
-    log.info("ETAPA 1/10 — Carregando configuração (.env)")
+    log.info("ETAPA 1/11 — Carregando configuração (.env)")
     load_dotenv()
 
     obrigatorias = ["PG_HOST", "PG_PORT", "PG_DB", "PG_USER", "PG_PASSWORD",
-                    "DB_TABELA", "DB_COL_NOME", "DB_COL_CPF"]
+                    "DB_TABELA", "DB_COL_NOME", "DB_COL_CPF",
+                    "IBGE", "COMPETENCIA"]
     cfg = {k: os.getenv(k) for k in [
         "PG_HOST", "PG_PORT", "PG_DB", "PG_USER", "PG_PASSWORD",
         "DB_TABELA", "DB_COL_NOME", "DB_COL_CPF", "DB_COL_CNS",
+        "IBGE", "COMPETENCIA", "CNES_API_URL",
         "XML_ENTRADA", "XML_SAIDA", "RELATORIO",
         "XML_SAIDA_REMOVER", "RELATORIO_REMOVER",
     ]}
@@ -131,6 +135,7 @@ def carregar_config() -> dict:
         log.error("Copie .env.example para .env e preencha os valores.")
         sys.exit(1)
 
+    cfg["CNES_API_URL"] = cfg.get("CNES_API_URL") or "http://172.16.10.21:8083/3.0/xml"
     cfg.setdefault("XML_ENTRADA", "arquivos/xml_modelo.xml")
     cfg["XML_ENTRADA"] = cfg.get("XML_ENTRADA") or "arquivos/xml_modelo.xml"
     cfg["XML_SAIDA"] = cfg.get("XML_SAIDA") or "arquivos/xml_modelo_corrigido.xml"
@@ -138,19 +143,57 @@ def carregar_config() -> dict:
     cfg["XML_SAIDA_REMOVER"] = cfg.get("XML_SAIDA_REMOVER") or "arquivos/xml_sem_cadastrados.xml"
     cfg["RELATORIO_REMOVER"] = cfg.get("RELATORIO_REMOVER") or "arquivos/relatorio_remocao.csv"
 
-    if not os.path.isfile(cfg["XML_ENTRADA"]):
-        log.error("XML de entrada não encontrado: %s", cfg["XML_ENTRADA"])
-        sys.exit(1)
-
     return cfg
 
 
 # --------------------------------------------------------------------------- #
-# Etapas 2 e 3 — Ler XML e criar cópia
+# Etapa 2 — Baixar o XML de entrada do endpoint do CNES
+# --------------------------------------------------------------------------- #
+def baixar_xml(cfg: dict):
+    """Baixa o XML do endpoint do CNES e grava em XML_ENTRADA.
+
+    A requisição é síncrona: o servidor mantém a conexão aberta enquanto gera
+    o arquivo. Aguardamos indefinidamente pela resposta (read timeout = None);
+    apenas a conexão tem timeout curto (10s) para falhar rápido se o host
+    estiver inacessível.
+    """
+    url = f'{cfg["CNES_API_URL"]}/{cfg["IBGE"]}/{cfg["COMPETENCIA"]}'
+    log.info("ETAPA 2/11 — Baixando XML do CNES: %s", url)
+    log.info("        Aguardando a geração do arquivo (pode demorar)...")
+
+    try:
+        resp = requests.get(url, timeout=(10, None), stream=True)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Falha no download do XML: %s", e)
+        sys.exit(1)
+
+    destino = cfg["XML_ENTRADA"]
+    os.makedirs(os.path.dirname(os.path.abspath(destino)), exist_ok=True)
+    with open(destino, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    tamanho = os.path.getsize(destino)
+    if tamanho == 0:
+        log.error("XML baixado está vazio: %s", destino)
+        sys.exit(1)
+    with open(destino, "rb") as f:
+        inicio = f.read(256).lstrip()
+    if not inicio.startswith(b"<"):
+        log.error("Conteúdo baixado não parece XML (não inicia com '<'): %s", destino)
+        sys.exit(1)
+
+    log.info("        XML salvo em %s (%d bytes)", destino, tamanho)
+
+
+# --------------------------------------------------------------------------- #
+# Etapas 3 e 4 — Ler XML e criar cópia
 # --------------------------------------------------------------------------- #
 def ler_e_copiar_xml(cfg: dict, origem: str, saida: str = None):
     saida = saida or cfg["XML_SAIDA"]
-    log.info("ETAPA 2/10 — Lendo XML de entrada: %s", cfg["XML_ENTRADA"])
+    log.info("ETAPA 3/11 — Lendo XML de entrada: %s", cfg["XML_ENTRADA"])
     # Para o XML gerado pela Radar (minificado) removemos os espaços em branco
     # insignificantes para poder reformatar no layout do modelo na gravação.
     # Para o oficial preservamos a formatação original.
@@ -158,7 +201,7 @@ def ler_e_copiar_xml(cfg: dict, origem: str, saida: str = None):
     parser = etree.XMLParser(remove_blank_text=remove_blank)
     tree = etree.parse(cfg["XML_ENTRADA"], parser)
 
-    log.info("ETAPA 3/10 — Criando cópia: %s", saida)
+    log.info("ETAPA 4/11 — Criando cópia: %s", saida)
     os.makedirs(os.path.dirname(os.path.abspath(saida)), exist_ok=True)
     shutil.copy2(cfg["XML_ENTRADA"], saida)
 
@@ -169,7 +212,7 @@ def ler_e_copiar_xml(cfg: dict, origem: str, saida: str = None):
 # Etapa 4 — Conexão
 # --------------------------------------------------------------------------- #
 def conectar(cfg: dict):
-    log.info("ETAPA 4/10 — Conectando ao PostgreSQL (%s:%s/%s)",
+    log.info("ETAPA 5/11 — Conectando ao PostgreSQL (%s:%s/%s)",
              cfg["PG_HOST"], cfg["PG_PORT"], cfg["PG_DB"])
     try:
         conn = psycopg2.connect(
@@ -195,7 +238,7 @@ def _identificador_tabela(nome: str) -> sql.Composed:
 # Etapa 5 — Carregar profissionais do banco em memória
 # --------------------------------------------------------------------------- #
 def carregar_banco(conn, cfg: dict) -> dict:
-    log.info("ETAPA 5/10 — Carregando profissionais do banco (%s)", cfg["DB_TABELA"])
+    log.info("ETAPA 6/11 — Carregando profissionais do banco (%s)", cfg["DB_TABELA"])
 
     col_cns = cfg.get("DB_COL_CNS")
     cols = [sql.Identifier(cfg["DB_COL_NOME"]), sql.Identifier(cfg["DB_COL_CPF"])]
@@ -229,11 +272,11 @@ def carregar_banco(conn, cfg: dict) -> dict:
 # Etapas 6 e 7 — Varrer XML, comparar e decidir
 # --------------------------------------------------------------------------- #
 def processar(tree, indice: dict):
-    log.info("ETAPA 6/10 — Varrendo profissionais do XML")
+    log.info("ETAPA 7/11 — Varrendo profissionais do XML")
     profissionais = tree.findall(".//DADOS_PROFISSIONAIS")
     log.info("        %d profissionais encontrados no XML", len(profissionais))
 
-    log.info("ETAPA 7/10 — Comparando CPFs (busca por nome)")
+    log.info("ETAPA 8/11 — Comparando CPFs (busca por nome)")
     linhas_relatorio = []
     contagem = defaultdict(int)
 
@@ -279,7 +322,7 @@ def processar(tree, indice: dict):
 # --------------------------------------------------------------------------- #
 def gravar_xml(tree, cfg: dict, origem: str, saida: str = None):
     saida = saida or cfg["XML_SAIDA"]
-    log.info("ETAPA 8/10 — Gravando XML: %s", saida)
+    log.info("ETAPA 9/11 — Gravando XML: %s", saida)
 
     if origem == "radar":
         # Reformatar no layout do xml_modelo.xml: uma tag por linha, sem
@@ -305,7 +348,7 @@ def gravar_xml(tree, cfg: dict, origem: str, saida: str = None):
 # Etapa 9 — Relatório CSV
 # --------------------------------------------------------------------------- #
 def gerar_relatorio(linhas, caminho: str, campos: list):
-    log.info("ETAPA 9/10 — Gerando relatório CSV: %s", caminho)
+    log.info("ETAPA 10/11 — Gerando relatório CSV: %s", caminho)
     with open(caminho, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=campos, delimiter=";")
         writer.writeheader()
@@ -316,7 +359,7 @@ def gerar_relatorio(linhas, caminho: str, campos: list):
 # Etapa 10 — Resumo
 # --------------------------------------------------------------------------- #
 def resumo(contagem: dict):
-    log.info("ETAPA 10/10 — Resumo final")
+    log.info("ETAPA 11/11 — Resumo final")
     total = sum(contagem.values())
     for status in ["OK", "CORRIGIDO", "NAO_ENCONTRADO", "AMBIGUO"]:
         log.info("        %-15s: %d", status, contagem.get(status, 0))
@@ -328,11 +371,11 @@ def resumo(contagem: dict):
 # --------------------------------------------------------------------------- #
 def remover_cadastrados(tree, indice: dict):
     """Remove do XML cada <DADOS_PROFISSIONAIS> cujo nome já existe no banco."""
-    log.info("ETAPA 6/10 — Varrendo profissionais do XML")
+    log.info("ETAPA 7/11 — Varrendo profissionais do XML")
     profissionais = tree.findall(".//DADOS_PROFISSIONAIS")
     log.info("        %d profissionais encontrados no XML", len(profissionais))
 
-    log.info("ETAPA 7/10 — Removendo profissionais já cadastrados (busca por nome)")
+    log.info("ETAPA 8/11 — Removendo profissionais já cadastrados (busca por nome)")
     linhas_relatorio = []
     contagem = defaultdict(int)
 
@@ -362,7 +405,7 @@ def remover_cadastrados(tree, indice: dict):
 
 
 def resumo_remocao(contagem: dict):
-    log.info("ETAPA 10/10 — Resumo final")
+    log.info("ETAPA 11/11 — Resumo final")
     total = sum(contagem.values())
     for status in ["REMOVIDO", "MANTIDO"]:
         log.info("        %-15s: %d", status, contagem.get(status, 0))
@@ -376,6 +419,8 @@ def main():
     cfg = carregar_config()
     acao = perguntar_acao()
     origem = perguntar_origem()
+
+    baixar_xml(cfg)
 
     if acao == "cpf":
         tree = ler_e_copiar_xml(cfg, origem)
