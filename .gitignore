@@ -1,0 +1,50 @@
+# ----- Segredos / configuração local -----
+.env
+.env.*
+!.env.example
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Empacotamento / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Cache de ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ----- Dados e saídas geradas -----
+# Contêm CPF/CNS (dados sensíveis) e arquivos grandes — não versionar.
+arquivos/*.csv
+arquivos/*.xml
+# Mantém a pasta e o XML de exemplo no repositório
+!arquivos/.gitkeep
+!arquivos/xml_modelo.xml
+
+# Logs
+*.log
+
+# ----- Sistema operacional / editor -----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Configuração local do Claude Code
+.claude/settings.local.json
